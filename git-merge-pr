@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Script providing a `git merge-pr` command to merge pulls requests from
+GitHub.
+
+Put this script in your `$PATH` and make it executable.
+
+See https://github.com/goerz/git-merge-pr.
+"""
+
+__author__ = "Michael Goerz <mail@michaelgoerz.net>"
+__license__ = "MIT"
+__version__ = "0.1.0"
+
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+
+
+def run_command(cmd, check=True, capture_output=True):
+    """Run a command and return the completed process."""
+    try:
+        result = subprocess.run(
+            cmd, check=check, text=True, capture_output=capture_output
+        )
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing command: {' '.join(cmd)}")
+        print(f"Exit code: {e.returncode}")
+        if capture_output:
+            print(f"Error output: {e.stderr}")
+        sys.exit(e.returncode)
+
+
+def get_pr_info(pr):
+    """Get information about a pull request from GitHub."""
+    cmd = [
+        "gh",
+        "pr",
+        "view",
+        pr,
+        "--json",
+        "headRefName,headRepository,headRepositoryOwner",
+    ]
+
+    try:
+        result = run_command(cmd)
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print(f"Failed to parse GitHub response for PR #{pr}")
+        sys.exit(1)
+
+
+def confirm_action(prompt, default=True):
+    """Ask for user confirmation."""
+    default_option = "Y/n" if default else "y/N"
+    response = input(f"{prompt} [{default_option}]: ").strip().lower()
+
+    if not response:
+        return default
+
+    return response[0] == "y"
+
+
+def get_current_branch():
+    """Get the name of the current git branch."""
+    cmd = ["git", "branch", "--show-current"]
+    result = run_command(cmd)
+    return result.stdout.strip()
+
+
+def update_current_branch(automatic=True):
+    """Update the current branch from upstream.
+
+    Args:
+        automatic: If True, automatically merge upstream changes.
+                  If False, only check if branch is up-to-date.
+    """
+    # Update all remote references and prune stale branches
+    run_command(["git", "remote", "update", "--prune"], capture_output=False)
+
+    if automatic:
+        # Fast-forward current branch to upstream
+        run_command(
+            ["git", "merge", "--ff-only", "@{u}"], capture_output=False
+        )
+    else:
+        # Check if current HEAD is identical to upstream branch
+        result = run_command(
+            ["git", "rev-list", "--count", "--left-right", "HEAD...@{u}"]
+        )
+        ahead_behind = result.stdout.strip()
+        if ahead_behind != "0\t0":
+            print("Error: Current branch is not up-to-date with upstream.")
+            print("Please update your branch manually and try again.")
+            sys.exit(1)
+
+
+def get_target_branch(pr, base_branch):
+    """Get the name of the branch tracking the given PR.
+
+    If necessary, this will create the branch, and check that it is up-to-date
+    with respect to the upstream branch.
+    """
+    run_command(["gh", "pr", "checkout", pr], capture_output=False)
+    branch = get_current_branch()
+    update_current_branch(automatic=False)
+    run_command(["git", "checkout", base_branch], capture_output=False)
+    return branch
+
+
+def check_target_branch(branch, base_branch, require_rebased=True):
+    """Check that branch is up-to-date for being merged into the base branch.
+
+    The base branch is assumed to be clean and up-to-date w.r.t. its upstream
+    branch.
+
+    If `require_rebased` is `True`, the `branch` must be on top of the base
+    branch.
+    """
+    run_command(["git", "checkout", branch], capture_output=False)
+    update_current_branch(automatic=False)
+    if require_rebased:
+        # Check if branch is on top of base_branch by finding the merge-base
+        # and comparing it with the base_branch HEAD
+        merge_base = run_command(["git", "merge-base", branch, base_branch])
+        base_head = run_command(["git", "rev-parse", base_branch])
+        if merge_base.stdout.strip() != base_head.stdout.strip():
+            print(
+                f"Error: Branch '{branch}' is not rebased on top of '{base_branch}'."
+            )
+            print(
+                f"Please rebase your branch on '{base_branch}' and try again."
+            )
+            print(f"You can use: git rebase {base_branch} {branch}")
+            sys.exit(1)
+    run_command(["git", "checkout", base_branch], capture_output=False)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="git merge-pr",
+        description="Merge a GitHub pull request from the command line.",
+        epilog="Additional arguments (...) must be separated from the preceding arguments by `--` and are forwarded to `git merge`. Useful options might include `--no-edit`, `--no-commit`, or `--ff`. By default, merging is always done with a merge commit.",
+    )
+    parser.add_argument("PR", help="Pull request number")
+    parser.add_argument(
+        "BRANCH",
+        nargs="*",
+        help="Local branch name tracking the PR. If not given, automatically determined via `gh pr checkout PR`",
+    )
+    parser.add_argument(
+        "--no-check-base-branch",
+        action="store_true",
+        help="Skip checking and updating the base (current) branch",
+    )
+    parser.add_argument(
+        "--no-require-rebased",
+        action="store_true",
+        help="Do not require BRANCH to be rebased on the base (current) branch",
+    )
+
+    args = parser.parse_args()
+
+    if not re.match(r"^\d+$", args.PR):
+        print("PR must be given as a number")
+        sys.exit(1)
+
+    # Check current branch and update if needed
+    current_branch = get_current_branch()
+    if not args.no_check_base_branch:
+        if current_branch in ["master", "main"]:
+            print(f"Current branch is '{current_branch}'")
+            update_current_branch(automatic=True)
+        else:
+            print(
+                f"Warning: Current branch is '{current_branch}', not 'master' or 'main'"
+            )
+            if not confirm_action(
+                "Continue with merge anyway?", default=False
+            ):
+                print("Merge aborted.")
+                sys.exit(0)
+    base_branch = current_branch
+
+    if (not args.BRANCH) or args.BRANCH[0].startswith("-"):
+        branch = get_target_branch(args.PR, base_branch)
+        merge_flags = args.BRANCH
+    else:
+        branch, *merge_flags = args.BRANCH
+
+    # Get PR information from GitHub
+    pr_info = get_pr_info(args.PR)
+
+    # Extract the head ref name (branch name in the PR)
+    head_ref_name = pr_info.get("headRefName")
+
+    if not head_ref_name:
+        print("Could not determine branch name from PR information")
+        sys.exit(1)
+
+    # Check if the provided branch name contains the head ref name
+    if head_ref_name not in branch:
+        print(
+            f"Warning: PR branch name '{head_ref_name}' is not found in '{branch}'"
+        )
+        if not confirm_action("Continue with merge anyway?", default=False):
+            print("Merge aborted.")
+            sys.exit(0)
+
+    # Check that the target branch is up-to-date
+    check_target_branch(
+        branch, base_branch, require_rebased=(not args.no_require_rebased)
+    )
+
+    # Perform the merge
+    merge_cmd = [
+        "git",
+        "merge",
+        "--no-ff",
+        "--edit",
+        "-m",
+        f"Merge #{args.PR} from {branch}",
+    ]
+
+    if merge_flags:
+        merge_cmd.extend(merge_flags)
+
+    merge_cmd.append(branch)
+
+    merge_result = run_command(merge_cmd, check=False, capture_output=False)
+
+    if merge_result.returncode != 0:
+        print(f"Merge failed with exit code {merge_result.returncode}")
+        print(merge_result.stderr)
+        sys.exit(merge_result.returncode)
+
+    print("Merge successful!")
+
+    if confirm_action(f"Delete branch '{branch}'?", default=True):
+        delete_cmd = ["git", "branch", "-d", branch]
+        delete_result = run_command(
+            delete_cmd, check=False, capture_output=False
+        )
+
+        if delete_result.returncode == 0:
+            print(f"Branch '{branch}' deleted.")
+        else:
+            print(f"Failed to delete branch '{branch}':")
+            print(delete_result.stderr)
+
+
+if __name__ == "__main__":
+    main()
