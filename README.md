@@ -66,6 +66,14 @@ merge commit.
 
 Note that the script will not push the merge, and that the PR on GitHub thus will stay open until the next `git push`. It is strongly recommended to set up GitHub to [automatically delete branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-the-automatic-deletion-of-branches) when PRs are closed.
 
+Running `git merge-pr` will ensure that both the base branch (`master`/`main`) and the target `BRANCH` are up-to-date with respect to their remote branches. They will be updated using fast-forward merges only. If this is not possible, or if the target branch would have to be rebased, the merge is aborted. In this case, or simply to review the PR, please use
+
+```
+gh pr checkout PR
+```
+
+to locally check out the PR and to rewrite it as necessary.
+
 
 # Tips and Tricks
 
