@@ -222,7 +222,7 @@ def main():
         "--no-ff",
         "--edit",
         "-m",
-        f"Merge #{args.PR} from {branch}",
+        f"Merge #{args.PR} from branch `{branch}`",
     ]
 
     if merge_flags:
